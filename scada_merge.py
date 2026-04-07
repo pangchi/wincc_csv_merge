@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--preview",
     action="store_true",
-    help="Preview first 10,000 rows of merged result without saving."
+    help="Preview first N rows of merged result without saving."
 )
 parser.add_argument(
     "--preview-rows",
@@ -23,6 +23,11 @@ parser.add_argument(
     default=10000,
     metavar="N",
     help="Number of rows to preview (default: 10000). Only used with --preview."
+)
+parser.add_argument(
+    "--save-preview",
+    action="store_true",
+    help="Save the preview-truncated result to <output>_preview.csv (requires --preview)."
 )
 parser.add_argument(
     "--folder",
@@ -44,15 +49,19 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# ── Validate: --save-preview only makes sense with --preview ──
+if args.save_preview and not args.preview:
+    parser.error("--save-preview requires --preview")
+
 # ────────────────────────────────────────────────
 #  Settings
 # ────────────────────────────────────────────────
-folder_path        = args.folder
-file_pattern       = args.pattern
-output_file        = args.output
-time_column_suffix = " Time"
+folder_path         = args.folder
+file_pattern        = args.pattern
+output_file         = args.output
+time_column_suffix  = " Time"
 value_column_suffix = " ValueY"
-name_from          = "prefix"       # "prefix" or "filename"
+name_from           = "prefix"      # "prefix" or "filename"
 
 # ────────────────────────────────────────────────
 #  Helper: detect delimiter
@@ -64,24 +73,28 @@ def detect_delimiter(filepath, encoding):
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
         return dialect.delimiter
     except csv.Error:
-        return ","  # default fallback
+        return ","
 
 # ────────────────────────────────────────────────
 #  Helper: read CSV with robust encoding + delimiter
 # ────────────────────────────────────────────────
 FALLBACK_ENCODINGS = [
-    "utf-8-sig",    # UTF-8 with BOM (common from Excel)
-    "utf-16",       # UTF-16 with BOM (0xff 0xfe or 0xfe 0xff)
-    "utf-16-le",    # UTF-16 Little Endian without BOM
-    "utf-16-be",    # UTF-16 Big Endian without BOM
-    "cp1252",       # Windows Western Europe
-    "cp1250",       # Windows Central Europe
-    "iso-8859-1",   # Latin-1
-    "iso-8859-2",   # Latin-2 Eastern Europe
-    "latin1",       # Never fails – always last resort
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "cp1252",
+    "cp1250",
+    "iso-8859-1",
+    "iso-8859-2",
+    "latin1",       # never fails – always last resort
 ]
 
 def read_csv_auto(filepath, **kwargs):
+    """
+    Auto-detects encoding and delimiter, then reads the CSV.
+    Any kwargs (e.g. nrows, parse_dates) are forwarded to pd.read_csv.
+    """
     filename = Path(filepath).name
 
     with open(filepath, "rb") as f:
@@ -106,7 +119,8 @@ def read_csv_auto(filepath, **kwargs):
                 print(f"  ✗ [{enc}] only {df.shape[1]} col(s) with sep='{sep}' → retrying")
                 continue
 
-            print(f"  ✓ [{enc}] sep='{sep}' | {df.shape[1]} cols "
+            nrows_info = f" | nrows={kwargs['nrows']}" if "nrows" in kwargs else ""
+            print(f"  ✓ [{enc}] sep='{sep}' | {df.shape[1]} cols{nrows_info} "
                   f"(chardet: {chardet_enc} @ {confidence:.0%}) → {filename}")
             return df
 
@@ -129,14 +143,33 @@ if not files:
     print("No files found. Check folder_path and file_pattern.")
     exit()
 
-mode_label = "PREVIEW MODE (no file will be saved)" if args.preview else "MERGE & SAVE MODE"
+if args.preview and args.save_preview:
+    mode_label = "PREVIEW + SAVE MODE (truncated file will be saved)"
+elif args.preview:
+    mode_label = "PREVIEW MODE (no file will be saved)"
+else:
+    mode_label = "MERGE & SAVE MODE"
+
 print(f"{'─'*55}")
 print(f"  {mode_label}")
 print(f"  Folder  : {Path(folder_path).resolve()}")
 print(f"  Pattern : {file_pattern}")
-print(f"  Output  : {output_file}")
+if args.preview:
+    print(f"  Rows    : first {args.preview_rows:,} per file (optimised read)")
+if not args.preview or args.save_preview:
+    print(f"  Output  : {output_file}")
 print(f"{'─'*55}\n")
 print(f"Found {len(files)} file(s)\n")
+
+# ── In preview mode, cap each file read to preview_rows ──────
+read_kwargs = dict(
+    parse_dates=[0],
+    date_format="%m/%d/%Y %I:%M:%S %p",
+    dayfirst=False,
+    cache_dates=True,
+)
+if args.preview:
+    read_kwargs["nrows"] = args.preview_rows
 
 dfs                = []
 renamed_value_cols = set()
@@ -145,13 +178,7 @@ skipped            = []
 for f in files:
     print(f"Reading: {Path(f).name}")
     try:
-        df = read_csv_auto(
-            f,
-            parse_dates=[0],
-            date_format="%m/%d/%Y %I:%M:%S %p",
-            dayfirst=False,
-            cache_dates=True
-        )
+        df = read_csv_auto(f, **read_kwargs)
     except ValueError as e:
         print(f"  ⚠ Skipping: {e}\n")
         skipped.append(f)
@@ -227,14 +254,22 @@ if args.preview:
     print(f"  PREVIEW — first {n:,} of {len(merged):,} rows")
     print(f"{'─'*55}\n")
     with pd.option_context(
-        "display.max_rows",    n,
-        "display.max_columns", None,
-        "display.width",       None,
+        "display.max_rows",     n,
+        "display.max_columns",  None,
+        "display.width",        None,
         "display.float_format", "{:.4f}".format
     ):
         print(merged.head(n).to_string(index=True))
     print(f"\n{'─'*55}")
-    print(f"  Preview complete. Run without --preview to save.")
+
+    if args.save_preview:
+        preview_file = Path(output_file).stem + "_preview" + Path(output_file).suffix
+        merged.head(n).to_csv(preview_file, index=False, date_format="%Y-%m-%d %H:%M:%S")
+        print(f"  Preview saved to : {preview_file}")
+        print(f"  Rows written     : {n:,}")
+    else:
+        print(f"  Preview complete. Add --save-preview to save, or remove --preview to save full merge.")
+
     print(f"{'─'*55}")
 else:
     merged.to_csv(output_file, index=False, date_format="%Y-%m-%d %H:%M:%S")
