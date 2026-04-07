@@ -5,6 +5,8 @@ import chardet
 import csv
 import re
 import argparse
+import tempfile
+import os
 
 # ────────────────────────────────────────────────
 #  CLI Arguments
@@ -12,44 +14,22 @@ import argparse
 parser = argparse.ArgumentParser(
     description="Merge multiple sensor CSV files on a shared Time column."
 )
-parser.add_argument(
-    "--preview",
-    action="store_true",
-    help="Preview first N rows of merged result without saving."
-)
-parser.add_argument(
-    "--preview-rows",
-    type=int,
-    default=10000,
-    metavar="N",
-    help="Number of rows to preview (default: 10000). Only used with --preview."
-)
-parser.add_argument(
-    "--save-preview",
-    action="store_true",
-    help="Save the preview-truncated result to <output>_preview.csv (requires --preview)."
-)
-parser.add_argument(
-    "--folder",
-    type=str,
-    default=r"./",
-    help="Folder path containing CSV files (default: current directory)."
-)
-parser.add_argument(
-    "--pattern",
-    type=str,
-    default="*.csv",
-    help="File glob pattern (default: *.csv)."
-)
-parser.add_argument(
-    "--output",
-    type=str,
-    default="merged_sensors_2026.csv",
-    help="Output filename (default: merged_sensors_2026.csv)."
-)
+parser.add_argument("--preview",       action="store_true",
+    help="Preview first N rows of merged result without saving.")
+parser.add_argument("--preview-rows",  type=int, default=10000, metavar="N",
+    help="Number of rows to preview (default: 10000).")
+parser.add_argument("--save-preview",  action="store_true",
+    help="Save the preview-truncated result (requires --preview).")
+parser.add_argument("--folder",        type=str, default=r"./",
+    help="Folder path containing CSV files.")
+parser.add_argument("--pattern",       type=str, default="*.csv",
+    help="File glob pattern (default: *.csv).")
+parser.add_argument("--output",        type=str, default="merged_sensors_2026.csv",
+    help="Output filename.")
+parser.add_argument("--chunk-size",    type=int, default=100000, metavar="N",
+    help="Rows per chunk during merge (default: 100000). Lower = less RAM.")
 args = parser.parse_args()
 
-# ── Validate: --save-preview only makes sense with --preview ──
 if args.save_preview and not args.preview:
     parser.error("--save-preview requires --preview")
 
@@ -61,7 +41,7 @@ file_pattern        = args.pattern
 output_file         = args.output
 time_column_suffix  = " Time"
 value_column_suffix = " ValueY"
-name_from           = "prefix"      # "prefix" or "filename"
+name_from           = "prefix"
 
 # ────────────────────────────────────────────────
 #  Helper: detect delimiter
@@ -79,22 +59,12 @@ def detect_delimiter(filepath, encoding):
 #  Helper: read CSV with robust encoding + delimiter
 # ────────────────────────────────────────────────
 FALLBACK_ENCODINGS = [
-    "utf-8-sig",
-    "utf-16",
-    "utf-16-le",
-    "utf-16-be",
-    "cp1252",
-    "cp1250",
-    "iso-8859-1",
-    "iso-8859-2",
-    "latin1",       # never fails – always last resort
+    "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+    "cp1252", "cp1250", "iso-8859-1", "iso-8859-2",
+    "latin1",
 ]
 
 def read_csv_auto(filepath, **kwargs):
-    """
-    Auto-detects encoding and delimiter, then reads the CSV.
-    Any kwargs (e.g. nrows, parse_dates) are forwarded to pd.read_csv.
-    """
     filename = Path(filepath).name
 
     with open(filepath, "rb") as f:
@@ -131,9 +101,64 @@ def read_csv_auto(filepath, **kwargs):
     with open(filepath, "rb") as f:
         print(f.read(200))
     raise ValueError(
-        f"Could not parse '{filename}' into 2+ columns with any known encoding/delimiter.\n"
-        f"Check the file manually — it may be empty, binary, or have an unusual format."
+        f"Could not parse '{filename}' into 2+ columns with any known encoding/delimiter."
     )
+
+# ────────────────────────────────────────────────
+#  Chunked merge: streams through temp CSVs
+#  instead of holding everything in RAM
+# ────────────────────────────────────────────────
+def chunked_merge(base_df, new_df, chunk_size, output_path, write_header):
+    """
+    Merges base_df with new_df in chunks, writing rows directly to output_path.
+    Returns the number of rows written.
+    """
+    # Sort both frames by Time once
+    base_df = base_df.sort_values("Time").reset_index(drop=True)
+    new_df  = new_df.sort_values("Time").reset_index(drop=True)
+
+    rows_written = 0
+    mode = "w" if write_header else "a"
+
+    for start in range(0, len(base_df), chunk_size):
+        chunk = base_df.iloc[start : start + chunk_size]
+
+        # Get time window for this chunk
+        t_min = chunk["Time"].min()
+        t_max = chunk["Time"].max()
+
+        # Slice only the relevant rows from new_df
+        mask        = (new_df["Time"] >= t_min) & (new_df["Time"] <= t_max)
+        new_slice   = new_df[mask]
+
+        merged_chunk = pd.merge(chunk, new_slice, on="Time", how="outer")
+        merged_chunk = merged_chunk.sort_values("Time")
+
+        merged_chunk.to_csv(
+            output_path,
+            index=False,
+            mode=mode,
+            header=(rows_written == 0),
+            date_format="%Y-%m-%d %H:%M:%S"
+        )
+        rows_written += len(merged_chunk)
+        mode = "a"  # append after first write
+
+    # Flush any rows in new_df beyond the time range of base_df
+    t_base_max  = base_df["Time"].max()
+    tail_mask   = new_df["Time"] > t_base_max
+    tail        = new_df[tail_mask]
+    if not tail.empty:
+        tail.to_csv(
+            output_path,
+            index=False,
+            mode="a",
+            header=False,
+            date_format="%Y-%m-%d %H:%M:%S"
+        )
+        rows_written += len(tail)
+
+    return rows_written
 
 # ────────────────────────────────────────────────
 #  Main script
@@ -148,20 +173,20 @@ if args.preview and args.save_preview:
 elif args.preview:
     mode_label = "PREVIEW MODE (no file will be saved)"
 else:
-    mode_label = "MERGE & SAVE MODE"
+    mode_label = "MERGE & SAVE MODE (chunked)"
 
 print(f"{'─'*55}")
 print(f"  {mode_label}")
-print(f"  Folder  : {Path(folder_path).resolve()}")
-print(f"  Pattern : {file_pattern}")
+print(f"  Folder     : {Path(folder_path).resolve()}")
+print(f"  Pattern    : {file_pattern}")
+print(f"  Chunk size : {args.chunk_size:,} rows")
 if args.preview:
-    print(f"  Rows    : first {args.preview_rows:,} per file (optimised read)")
+    print(f"  Rows       : first {args.preview_rows:,} per file (optimised read)")
 if not args.preview or args.save_preview:
-    print(f"  Output  : {output_file}")
+    print(f"  Output     : {output_file}")
 print(f"{'─'*55}\n")
 print(f"Found {len(files)} file(s)\n")
 
-# ── In preview mode, cap each file read to preview_rows ──────
 read_kwargs = dict(
     parse_dates=[0],
     date_format="%m/%d/%Y %I:%M:%S %p",
@@ -192,7 +217,6 @@ for f in files:
     else:
         sensor = Path(f).stem.strip()
 
-    # Generic "Trend X" header → fall back to filename
     if re.match(r"^Trend\s*\d+$", sensor, re.IGNORECASE):
         sensor = Path(f).stem.strip()
         print(f"  ↳ Generic header detected → using filename: '{sensor}'")
@@ -207,10 +231,12 @@ for f in files:
         value_new_name = f"{value_new_name}_{i}"
     renamed_value_cols.add(value_new_name)
 
-    df = df.rename(columns={
-        time_col:  "Time",
-        value_col: value_new_name
-    })
+    df = df.rename(columns={time_col: "Time", value_col: value_new_name})
+
+    # Downcast float64 → float32 to halve memory per column
+    for col in df.select_dtypes(include="float64").columns:
+        df[col] = df[col].astype("float32")
+
     dfs.append(df)
 
 if skipped:
@@ -223,31 +249,57 @@ if not dfs:
     exit()
 
 # ────────────────────────────────────────────────
-#  Merge
+#  Merge — chunked to avoid RAM explosion
 # ────────────────────────────────────────────────
-print(f"\nMerging {len(dfs)} dataframe(s)...")
-merged = dfs[0]
-for df in dfs[1:]:
-    merged = pd.merge(
-        merged,
-        df,
-        on="Time",
-        how="outer",
-        sort=True
-    )
+if args.preview and not args.save_preview:
+    # In screen-only preview: do a normal in-memory merge (rows already capped)
+    print(f"\nMerging {len(dfs)} dataframe(s) in memory (preview, rows capped)...")
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = pd.merge(merged, df, on="Time", how="outer", sort=True)
+    merged = merged.sort_values("Time").reset_index(drop=True)
+    save_path = None
 
-merged = merged.sort_values("Time").reset_index(drop=True)
+else:
+    # Full merge or save-preview: stream through temp file then rename
+    tmp_path = output_file + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
-# Optional: convert to Singapore timezone
-# merged["Time"] = merged["Time"].dt.tz_localize("UTC").dt.tz_convert("Asia/Singapore")
+    print(f"\nMerging {len(dfs)} dataframe(s) in chunks of {args.chunk_size:,}...")
 
-print(f"\nFinal shape : {merged.shape}")
-print(f"Time range  : {merged['Time'].min()}  →  {merged['Time'].max()}")
-print(f"Sensors     : {list(merged.columns[1:])}")
+    # Start with first dataframe, write to temp file in chunks
+    base = dfs[0]
+    for i, df in enumerate(dfs[1:], start=2):
+        print(f"  Merging file {i}/{len(dfs)}...")
+
+        # Use a fresh temp file each round to avoid re-reading huge files
+        round_tmp = output_file + f".round{i}.tmp"
+        chunked_merge(base, df, args.chunk_size, round_tmp, write_header=True)
+
+        # Read the round result back as the new base
+        # Use float32 to keep memory low
+        base = pd.read_csv(
+            round_tmp,
+            parse_dates=["Time"],
+            dtype={c: "float32" for c in renamed_value_cols if c != "Time"}
+        )
+        os.remove(round_tmp)
+        print(f"    ✓ Running shape after merge: {base.shape}")
+
+    merged   = base.sort_values("Time").reset_index(drop=True)
+    save_path = output_file
+
+    if args.preview and args.save_preview:
+        save_path = Path(output_file).stem + "_preview" + Path(output_file).suffix
 
 # ────────────────────────────────────────────────
 #  Preview or Save
 # ────────────────────────────────────────────────
+print(f"\nFinal shape : {merged.shape}")
+print(f"Time range  : {merged['Time'].min()}  →  {merged['Time'].max()}")
+print(f"Sensors     : {list(merged.columns[1:])}")
+
 if args.preview:
     n = min(args.preview_rows, len(merged))
     print(f"\n{'─'*55}")
@@ -263,14 +315,13 @@ if args.preview:
     print(f"\n{'─'*55}")
 
     if args.save_preview:
-        preview_file = Path(output_file).stem + "_preview" + Path(output_file).suffix
-        merged.head(n).to_csv(preview_file, index=False, date_format="%Y-%m-%d %H:%M:%S")
-        print(f"  Preview saved to : {preview_file}")
+        merged.head(n).to_csv(save_path, index=False, date_format="%Y-%m-%d %H:%M:%S")
+        print(f"  Preview saved to : {save_path}")
         print(f"  Rows written     : {n:,}")
     else:
         print(f"  Preview complete. Add --save-preview to save, or remove --preview to save full merge.")
-
     print(f"{'─'*55}")
+
 else:
-    merged.to_csv(output_file, index=False, date_format="%Y-%m-%d %H:%M:%S")
-    print(f"\nSaved to: {output_file}")
+    merged.to_csv(save_path, index=False, date_format="%Y-%m-%d %H:%M:%S")
+    print(f"\nSaved to: {save_path}")
