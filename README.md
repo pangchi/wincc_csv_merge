@@ -1,17 +1,11 @@
-# wincc_csv_merge
-Merge Siemens WinCC csv files
-
-# Normal merge and save
-python scada_merge.py
-
-# Preview first 10,000 rows (no file written)
+# Just preview on screen, no save
 python scada_merge.py --preview
 
-# Preview a custom number of rows
-python scada_merge.py --preview --preview-rows 500
+# Preview on screen AND save truncated file
+python scada_merge.py --preview --save-preview
 
-# Override folder, pattern, output on the fly
-python scada_merge.py --folder "C:\data\scada" --pattern "2026_*.csv" --output merged_jan.csv
+# Custom row count, preview + save
+python scada_merge.py --preview --preview-rows 500 --save-preview
 
-# Preview with custom folder
-python scada_merge.py --preview --folder "C:\data\scada" --pattern "5_HF_*.csv"
+# Full merge and save (unchanged)
+python scada_merge.py
